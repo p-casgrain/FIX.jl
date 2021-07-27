@@ -1,12 +1,9 @@
 module FIX
 
-using DataStructures
+using DataStructures: OrderedDict, CircularBuffer
 using DandelionWebSockets
-
-global const TAGS_INT_STRING = Dict{Int64, String}()
-global const TAGS_STRING_INT = Dict{String, Int64}()
-
-import Base: start, next, done, length, collect, close
+using Dates
+import Base: start, length, collect, close
 
 abstract type AbstractMessageHandler <: DandelionWebSockets.WebSocketHandler end
 export AbstractMessageHandler, FIXClient, send_message, start, close
@@ -18,13 +15,12 @@ function onFIXMessage(this::AbstractMessageHandler, x::Any)
     throw(ErrorException("Method `onFIXMessage` is not implemented by $T for argument type $X"))
 end
 
-function __init__()
-    global TAGS_INT_STRING
-    global TAGS_STRING_INT
-
-    fid = open(joinpath(@__DIR__, "../etc/tags.csv"), "r");
+"Load FIX tags as vector of tuples from csv file at path `csv_path`"
+function load_fix_tags(csv_path)
+    fid = open(joinpath(@__DIR__, csv_path), "r");
     line_number = 0
-    while !eof(fid)
+    tagval_tpl_vec = Vector{Tuple{Int64,String}}()
+    while  !eof(fid)
         line_number += 1
         line = readline(fid);
         data = split(line, ",");
@@ -34,25 +30,26 @@ function __init__()
         end
         tag = parse(Int64, String(data[1]))
         val = String(data[2])
-
-        TAGS_INT_STRING[tag] = val
-        TAGS_STRING_INT[val] = tag
+        push!(tagval_tpl_vec,(tag,val))
     end
     close(fid)
+    return tagval_tpl_vec
+end
 
-    return nothing
+
+function __init__()
+    # load FIX tags
+    tagval_tpl_vec = load_fix_tags("../etc/tags.csv")
+    global const TAGS_INT_STRING = Dict( x => y for (x,y) in tagval_tpl_vec )
+    global const TAGS_STRING_INT = Dict( y => x for (x,y) in tagval_tpl_vec )
+    return
 end
 
 mutable struct FIXClientTasks
-    read::Nullable{Task}
-    function FIXClientTasks()
-        return new(Nullable{Task}())
-    end
+    read::Union{Task,Nothing}
 end
 
-mutable struct Container{T}
-    data::T
-end
+FIXClientTasks() = FIXClientTasks(nothing)
 
 include("parse.jl")
 include("management.jl")
@@ -65,43 +62,34 @@ struct FIXClient{T <: IO, H <: AbstractMessageHandler}
     m_tasks::FIXClientTasks
     m_messages::FIXMessageManagement
     m_lock::ReentrantLock
-    #optimization
-    m_intmap::Dict{Int64, String}
     function FIXClient(stream::T,
                         handler::H,
                         header::Dict{Int64, String},
                         ratelimit::RateLimit;
-                        delimiter::Char = Char(1)) where {T <: IO, H <: AbstractMessageHandler}
-        m_intmap = Dict{Int64, String}()
-        [m_intmap[id] = string(id) for id = 1 : 9999]
+                        delimiter::Char = Char(1)) where {T,H}
         return new{T, H}(stream,
                         handler,
                         delimiter,
                         header,
                         FIXClientTasks(),
                         FIXMessageManagement(ratelimit),
-                        ReentrantLock(),
-                        m_intmap)
+                        ReentrantLock())
     end
 end
 
-checksum(this::String)::Int64 = sum([Int(x) for x in this]) % 256
-fixjoin(this::OrderedDict{Int64, String}, delimiter::Char)::String = join([string(k) * "=" * v for (k, v) in this], delimiter) * delimiter
+checksum(chk_str::String)::Int64 = sum([Int(x) for x in chk_str]) % 256
+fixjoin(msg_dct::AbstractDict{Int64, String}, delimiter::Char)::String = join([string(k) * "=" * v for (k, v) in msg_dct], delimiter) * delimiter
 
-function fixjoin(this::OrderedDict{Int64, String}, delimiter::Char, IntMap::Dict{Int64, String})::String
-    join([IntMap[k] * "=" * v for (k, v) in this], delimiter) * delimiter
-end
-
-function fixmessage(this::FIXClient, msg::Dict{Int64, String})::OrderedDict{Int64, String}
+function fixmessage(client::FIXClient, msg::Dict{Int64, String})::OrderedDict{Int64, String}
     ordered = OrderedDict{Int64, String}()
-
+    sizehint!(ordered,length(client.m_head) + length(msg) + 4)
     #header
-    ordered[8] = this.m_head[8]
+    ordered[8] = client.m_head[8]
     ordered[9] = ""
     ordered[35] = msg[35] #message type
-    ordered[49] = this.m_head[49] #SenderCompID
-    ordered[56] = this.m_head[56] #TargetCompID
-    ordered[34] = getNextOutgoingMsgSeqNum(this)
+    ordered[49] = client.m_head[49] #SenderCompID
+    ordered[56] = client.m_head[56] #TargetCompID
+    ordered[34] = getNextOutgoingMsgSeqNum(client)
     ordered[52] = ""
     #body
     body_length = 0
@@ -116,10 +104,11 @@ function fixmessage(this::FIXClient, msg::Dict{Int64, String})::OrderedDict{Int6
             body_length += length(string(k)) + 1 + length(v) + 1 #tag=value|
         end
     end
+
     ordered[9] = string(body_length)
 
     #tail
-    msg = fixjoin(ordered, this.delimiter, this.m_intmap)
+    msg = fixjoin(ordered, client.delimiter)
     c = checksum(msg)
     c_str = string(c)
     while length(c_str) < 3
@@ -135,7 +124,7 @@ function send_message_fake(this::FIXClient, msg::Dict{Int64, String})
     lock(this.m_lock)
 
     msg = fixmessage(this, msg)
-    msg_str = fixjoin(msg, this.delimiter, this.m_intmap)
+    msg_str = fixjoin(msg, this.delimiter)
     # write(this.stream, msg_str)
     onSent(this.m_messages, msg)
 
@@ -148,7 +137,7 @@ function send_message(this::FIXClient, msg::Dict{Int64, String})
     lock(this.m_lock)
 
     msg = fixmessage(this, msg)
-    msg_str = fixjoin(msg, this.delimiter, this.m_intmap)
+    msg_str = fixjoin(msg, this.delimiter)
     write(this.stream, msg_str)
     onSent(this.m_messages, msg)
 
@@ -158,7 +147,7 @@ function send_message(this::FIXClient, msg::Dict{Int64, String})
 end
 
 function start(this::FIXClient)
-    this.m_tasks.read = Nullable( @async begin
+    this.m_tasks.read = @async begin
         while true
             incoming = readavailable(this.stream)
             if isempty(incoming)
@@ -173,36 +162,19 @@ function start(this::FIXClient)
         end
         @printf("[%ls] FIX: read task done\n", now())
     end
-    )
+    
     return this.m_tasks
 end
 
-function close(this::FIXClient)
-    close(this.stream)
-end
+close(this::FIXClient) = close(this.stream)
 
-function onGet(this::FIXClient, msg::DICTMSG)
-    onGet(this.m_messages, msg)
-end
+onGet(this::FIXClient, msg::DICTMSG) = onGet(this.m_messages, msg)
 
-function getOpenOrders(this::FIXClient)::Vector{Dict{Int64, String}}
-    return getOpenOrders(this.m_messages)
-end
+getOpenOrders(this::FIXClient) = getOpenOrders(this.m_messages)
 
-function getNextOutgoingMsgSeqNum(this::FIXClient)
-    return getNextOutgoingMsgSeqNum(this.m_messages)
-end
+getPosition(this::FIXClient, instrument::String) = getPosition(this.m_messages, instrument)
+getPositions(this::FIXClient) = getPositions(this.m_messages)
 
-function getPosition(this::FIXClient, instrument::String)
-    return getPosition(this.m_messages, instrument)
-end
+numMsgsLeftToSend(this::FIXClient) = numleft(this.m_messages.outgoing.ratelimit, now())
 
-function getPositions(this::FIXClient)
-    return getPositions(this.m_messages)
-end
-
-function numMsgsLeftToSend(this::FIXClient)
-    return numleft(this.m_messages.outgoing.ratelimit, now())
-end
-
-end
+getNextOutgoingMsgSeqNum(this::FIXClient) = getNextOutgoingMsgSeqNum(this.m_messages)

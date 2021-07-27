@@ -1,7 +1,9 @@
+using Printf: @printf
 const DICTMSG = OrderedDict{Int64, String}
-import Base: push!
-
 export RateLimit, isexceeded, numleft
+
+
+# RateLimit Object and associated methods
 
 struct RateLimit
     buffer::CircularBuffer{DateTime}
@@ -36,6 +38,8 @@ function numleft(this::RateLimit, n::DateTime)::Int64
     return out
 end
 
+
+
 struct FIXIncomingMessages
     login::DICTMSG
     logout::DICTMSG
@@ -44,7 +48,7 @@ struct FIXIncomingMessages
     orderReject::Vector{DICTMSG}
     resend::Vector{DICTMSG}
     heartbeat::Vector{DICTMSG}
-    msgseqnum::Container{String}
+    msgseqnum::Ref{String}
     ratelimit::RateLimit
     function FIXIncomingMessages(ratelimit::RateLimit)
         return new(DICTMSG(),
@@ -54,7 +58,7 @@ struct FIXIncomingMessages
                 Vector{DICTMSG}(0),
                 Vector{DICTMSG}(0),
                 Vector{DICTMSG}(0),
-                Container("0"),
+                Ref("0"),
                 ratelimit)
     end
 end
@@ -66,7 +70,7 @@ struct FIXOutgoingMessages
     orderCancelRequest::Dict{String, DICTMSG} #client order id ->
     orderStatusRequest::Vector{DICTMSG}
     orderCancelReplaceRequest::Dict{String ,DICTMSG}
-    msgseqnum::Container{Int64}
+    msgseqnum::Ref{Int64}
     ratelimit::RateLimit
     function FIXOutgoingMessages(ratelimit::RateLimit)
         return new(DICTMSG(),
@@ -106,7 +110,7 @@ struct FIXMessageManagement
     end
 end
 
-function getPosition(this::FIXIncomingMessages, instrument::String)
+function getPositions(this::FIXIncomingMessages, instrument::String)
     out = 0.0
     if !haskey(this.executionReports, "1")
         return out
@@ -151,7 +155,7 @@ function getPositions(this::FIXIncomingMessages)
 end
 
 function onNewMessage(this::FIXIncomingMessages, msg::DICTMSG)
-    this.msgseqnum.data = msg[34]
+    this.msgseqnum[] = msg[34]
     msg_type = msg[35]
 
     if msg_type == "8"
@@ -159,7 +163,7 @@ function onNewMessage(this::FIXIncomingMessages, msg::DICTMSG)
     elseif msg_type == "9"
         addOrderCancelReject(this, msg)
     elseif msg_type == "3"
-        @printf("[%ls][FIX:ER] received order reject. Reason: %ls\n", now(), msg[58])
+        @printf "[$(now())][FIX:ER] received order reject. Reason: $(msg[58])"
         addOrderReject(this, msg)
     elseif msg_type == "0"
         addHeartbeat(this, msg)
@@ -209,7 +213,7 @@ end
 
 function onNewMessage(this::FIXOutgoingMessages, msg::DICTMSG)
     msg_type = msg[35]
-    this.msgseqnum.data = parse(Int64, msg[34])
+    this.msgseqnum[] = parse(Int64, msg[34])
 
     if msg_type == "D"
         addNewOrderSingle(this, msg)
@@ -224,7 +228,7 @@ function onNewMessage(this::FIXOutgoingMessages, msg::DICTMSG)
     elseif msg_type == "G"
         addCancelReplace(this, msg)
     else
-        @printf("[%ls] Unknown OUTGOING msg type %ls\n", now(), msg_type)
+         @printf("[%ls] Unknown OUTGOING msg type %ls\n", now(), msg_type)
     end
     return nothing
 end
@@ -261,11 +265,9 @@ end
 
 function onGet(this::FIXMessageManagement, msg::DICTMSG)
     onNewMessage(this.incoming, msg)
-
     if msg[35] == "8"
         onExecutionReport(this.open, msg)
     end
-
     return nothing
 end
 
@@ -294,29 +296,14 @@ function onFill(this::FIXOpenOrders, msg::DICTMSG)
     orig_exec[38] = string(cur_amount)
 end
 
-function onDone(this::FIXOpenOrders, msg::DICTMSG)
-    deleteOrderByExchangeID(this, msg[37])
-end
+onDone(this::FIXOpenOrders, msg::DICTMSG) = deleteOrderByExchangeID(this, msg[37])
+onCancel(this::FIXOpenOrders, msg::DICTMSG) = deleteOrderByExchangeID(this, msg[37])
+onReject(this::FIXOpenOrders, msg::DICTMSG) = deleteOrderByExchangeID(this, msg[37])
 
-function onCancel(this::FIXOpenOrders, msg::DICTMSG)
-    deleteOrderByExchangeID(this, msg[37])
-end
+getOrderByExchangeID(this::FIXOpenOrders, exchange_id::String) = this.exchng_id[exchange_id]
 
-function onReject(this::FIXOpenOrders, msg::DICTMSG)
-    deleteOrderByExchangeID(this, msg[37])
-end
-
-function getOrderByExchangeID(this::FIXOpenOrders, exchange_id::String)
-    return this.exchng_id[exchange_id]
-end
-
-function hasOrderByClientID(this::FIXOpenOrders, client_id::String)
-    return haskey(this.client_id, client_id)
-end
-
-function hasOrderByExchangeID(this::FIXOpenOrders, exchange_id::String)
-    return haskey(this.exchng_id, exchange_id)
-end
+hasOrderByClientID(this::FIXOpenOrders, client_id::String) = haskey(this.client_id, client_id)
+hasOrderByExchangeID(this::FIXOpenOrders, exchange_id::String) = haskey(this.exchng_id, exchange_id)
 
 function deleteOrderByExchangeID(this::FIXOpenOrders, exchange_id::String)::Void
     if !hasOrderByExchangeID(this, exchange_id)
@@ -356,26 +343,11 @@ function onExecutionReport(this::FIXOpenOrders, msg::DICTMSG)
     end
 end
 
-function getOrders(this::FIXOpenOrders)::Vector{DICTMSG}
-    return collect(values(this.client_id))
-end
+getOrders(this::FIXOpenOrders)::Vector{DICTMSG} =  collect(values(this.client_id))
+getOpenOrders(this::FIXMessageManagement)::Vector{DICTMSG} = getOrders(this.open)
 
-function getOpenOrders(this::FIXMessageManagement)::Vector{DICTMSG}
-    return getOrders(this.open)
-end
+getNextOutgoingMsgSeqNum(this::FIXMessageManagement) = getNextOutgoingMsgSeqNum(this.outgoing)
+getNextOutgoingMsgSeqNum(this::FIXOutgoingMessages) = string(this.msgseqnum.data + 1)
 
-function getNextOutgoingMsgSeqNum(this::FIXMessageManagement)::String
-    return getNextOutgoingMsgSeqNum(this.outgoing)
-end
-
-function getNextOutgoingMsgSeqNum(this::FIXOutgoingMessages)::String
-    return string(this.msgseqnum.data + 1)
-end
-
-function getPosition(this::FIXMessageManagement, instrument::String)
-    return getPosition(this.incoming, instrument)
-end
-
-function getPositions(this::FIXMessageManagement)
-    return getPositions(this.incoming)
-end
+getPositions(this::FIXMessageManagement, instrument::String) = getPositions(this.incoming, instrument)
+getPositions(this::FIXMessageManagement) = getPositions(this.incoming)
