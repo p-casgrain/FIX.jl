@@ -3,11 +3,15 @@ module FIX
 using DataStructures: OrderedDict, CircularBuffer
 using DandelionWebSockets
 using Dates
-import Base: start, length, collect, close
+import Base: length, collect
 
 abstract type AbstractMessageHandler <: DandelionWebSockets.WebSocketHandler end
 export AbstractMessageHandler, FIXClient, send_message, start, close
 export onFIXMessage
+
+global const TAGS_INT_STRING = Dict{Int64, String}()
+global const TAGS_STRING_INT = Dict{String, Int64}()
+
 
 function onFIXMessage(this::AbstractMessageHandler, x::Any)
     T = typeof(this)
@@ -19,7 +23,7 @@ end
 function load_fix_tags(csv_path)
     fid = open(joinpath(@__DIR__, csv_path), "r");
     line_number = 0
-    tagval_tpl_vec = Vector{Tuple{Int64,String}}()
+    tagval_tpl_vec = Vector{Pair{Int64,String}}()
     while  !eof(fid)
         line_number += 1
         line = readline(fid);
@@ -30,7 +34,7 @@ function load_fix_tags(csv_path)
         end
         tag = parse(Int64, String(data[1]))
         val = String(data[2])
-        push!(tagval_tpl_vec,(tag,val))
+        Base.push!(tagval_tpl_vec,(tag => val))
     end
     close(fid)
     return tagval_tpl_vec
@@ -40,8 +44,8 @@ end
 function __init__()
     # load FIX tags
     tagval_tpl_vec = load_fix_tags("../etc/tags.csv")
-    global const TAGS_INT_STRING = Dict( x => y for (x,y) in tagval_tpl_vec )
-    global const TAGS_STRING_INT = Dict( y => x for (x,y) in tagval_tpl_vec )
+    global TAGS_INT_STRING = Dict( x => y for (x,y) in tagval_tpl_vec )
+    global TAGS_STRING_INT = Dict( y => x for (x,y) in tagval_tpl_vec )
     return
 end
 
@@ -178,3 +182,5 @@ getPositions(this::FIXClient) = getPositions(this.m_messages)
 numMsgsLeftToSend(this::FIXClient) = numleft(this.m_messages.outgoing.ratelimit, now())
 
 getNextOutgoingMsgSeqNum(this::FIXClient) = getNextOutgoingMsgSeqNum(this.m_messages)
+
+end

@@ -163,7 +163,8 @@ function onNewMessage(this::FIXIncomingMessages, msg::DICTMSG)
     elseif msg_type == "9"
         addOrderCancelReject(this, msg)
     elseif msg_type == "3"
-        @printf "[$(now())][FIX:ER] received order reject. Reason: $(msg[58])"
+        @printf("[%ls][FIX:ER] received order reject. Reason: %ls",now(),msg[58])
+        @printf("[%ls] Unknown INCOMING message type: %ls\n", now(), msg_type)
         addOrderReject(this, msg)
     elseif msg_type == "0"
         addHeartbeat(this, msg)
